@@ -71,7 +71,7 @@ from tasks.sync_website_document_indexing_task import sync_website_document_inde
 
 class DatasetService:
     @staticmethod
-    def get_datasets(page, per_page, tenant_id=None, user=None, search=None, tag_ids=None):
+    def get_datasets(page, per_page, tenant_id=None, user=None, search=None, tag_ids=None, include_all=False):
         query = Dataset.query.filter(Dataset.tenant_id == tenant_id).order_by(Dataset.created_at.desc())
 
         if user:
@@ -86,25 +86,30 @@ class DatasetService:
                 else:
                     return [], 0
             else:
-                # show all datasets that the user has permission to access
-                if permitted_dataset_ids:
-                    query = query.filter(
-                        db.or_(
-                            Dataset.permission == DatasetPermissionEnum.ALL_TEAM,
-                            db.and_(Dataset.permission == DatasetPermissionEnum.ONLY_ME, Dataset.created_by == user.id),
-                            db.and_(
-                                Dataset.permission == DatasetPermissionEnum.PARTIAL_TEAM,
-                                Dataset.id.in_(permitted_dataset_ids),
-                            ),
+                if user.current_role != TenantAccountRole.OWNER or not include_all:
+                    # show all datasets that the user has permission to access
+                    if permitted_dataset_ids:
+                        query = query.filter(
+                            db.or_(
+                                Dataset.permission == DatasetPermissionEnum.ALL_TEAM,
+                                db.and_(
+                                    Dataset.permission == DatasetPermissionEnum.ONLY_ME, Dataset.created_by == user.id
+                                ),
+                                db.and_(
+                                    Dataset.permission == DatasetPermissionEnum.PARTIAL_TEAM,
+                                    Dataset.id.in_(permitted_dataset_ids),
+                                ),
+                            )
                         )
-                    )
-                else:
-                    query = query.filter(
-                        db.or_(
-                            Dataset.permission == DatasetPermissionEnum.ALL_TEAM,
-                            db.and_(Dataset.permission == DatasetPermissionEnum.ONLY_ME, Dataset.created_by == user.id),
+                    else:
+                        query = query.filter(
+                            db.or_(
+                                Dataset.permission == DatasetPermissionEnum.ALL_TEAM,
+                                db.and_(
+                                    Dataset.permission == DatasetPermissionEnum.ONLY_ME, Dataset.created_by == user.id
+                                ),
+                            )
                         )
-                    )
         else:
             # if no user, only show datasets that are shared with all team members
             query = query.filter(Dataset.permission == DatasetPermissionEnum.ALL_TEAM)
@@ -377,14 +382,19 @@ class DatasetService:
         if dataset.tenant_id != user.current_tenant_id:
             logging.debug(f"User {user.id} does not have permission to access dataset {dataset.id}")
             raise NoPermissionError("You do not have permission to access this dataset.")
-        if dataset.permission == DatasetPermissionEnum.ONLY_ME and dataset.created_by != user.id:
-            logging.debug(f"User {user.id} does not have permission to access dataset {dataset.id}")
-            raise NoPermissionError("You do not have permission to access this dataset.")
-        if dataset.permission == "partial_members":
-            user_permission = DatasetPermission.query.filter_by(dataset_id=dataset.id, account_id=user.id).first()
-            if not user_permission and dataset.tenant_id != user.current_tenant_id and dataset.created_by != user.id:
+        if user.current_role != TenantAccountRole.OWNER:
+            if dataset.permission == DatasetPermissionEnum.ONLY_ME and dataset.created_by != user.id:
                 logging.debug(f"User {user.id} does not have permission to access dataset {dataset.id}")
                 raise NoPermissionError("You do not have permission to access this dataset.")
+            if dataset.permission == "partial_members":
+                user_permission = DatasetPermission.query.filter_by(dataset_id=dataset.id, account_id=user.id).first()
+                if (
+                    not user_permission
+                    and dataset.tenant_id != user.current_tenant_id
+                    and dataset.created_by != user.id
+                ):
+                    logging.debug(f"User {user.id} does not have permission to access dataset {dataset.id}")
+                    raise NoPermissionError("You do not have permission to access this dataset.")
 
     @staticmethod
     def check_dataset_operator_permission(user: Optional[Account] = None, dataset: Optional[Dataset] = None):
@@ -394,15 +404,16 @@ class DatasetService:
         if not user:
             raise ValueError("User not found")
 
-        if dataset.permission == DatasetPermissionEnum.ONLY_ME:
-            if dataset.created_by != user.id:
-                raise NoPermissionError("You do not have permission to access this dataset.")
+        if user.current_role != TenantAccountRole.OWNER:
+            if dataset.permission == DatasetPermissionEnum.ONLY_ME:
+                if dataset.created_by != user.id:
+                    raise NoPermissionError("You do not have permission to access this dataset.")
 
-        elif dataset.permission == DatasetPermissionEnum.PARTIAL_TEAM:
-            if not any(
-                dp.dataset_id == dataset.id for dp in DatasetPermission.query.filter_by(account_id=user.id).all()
-            ):
-                raise NoPermissionError("You do not have permission to access this dataset.")
+            elif dataset.permission == DatasetPermissionEnum.PARTIAL_TEAM:
+                if not any(
+                    dp.dataset_id == dataset.id for dp in DatasetPermission.query.filter_by(account_id=user.id).all()
+                ):
+                    raise NoPermissionError("You do not have permission to access this dataset.")
 
     @staticmethod
     def get_dataset_queries(dataset_id: str, page: int, per_page: int):
@@ -423,6 +434,12 @@ class DatasetService:
 
     @staticmethod
     def get_dataset_auto_disable_logs(dataset_id: str) -> dict:
+        features = FeatureService.get_features(current_user.current_tenant_id)
+        if not features.billing.enabled or features.billing.subscription.plan == "sandbox":
+            return {
+                "document_ids": [],
+                "count": 0,
+            }
         # get recent 30 days auto disable logs
         start_date = datetime.datetime.now() - datetime.timedelta(days=30)
         dataset_auto_disable_logs = DatasetAutoDisableLog.query.filter(
@@ -441,7 +458,7 @@ class DatasetService:
 
 
 class DocumentService:
-    DEFAULT_RULES = {
+    DEFAULT_RULES: dict[str, Any] = {
         "mode": "custom",
         "rules": {
             "pre_processing_rules": [
@@ -455,7 +472,7 @@ class DocumentService:
         },
     }
 
-    DOCUMENT_METADATA_SCHEMA = {
+    DOCUMENT_METADATA_SCHEMA: dict[str, Any] = {
         "book": {
             "title": str,
             "language": str,
@@ -775,13 +792,19 @@ class DocumentService:
             dataset.indexing_technique = knowledge_config.indexing_technique
             if knowledge_config.indexing_technique == "high_quality":
                 model_manager = ModelManager()
-                embedding_model = model_manager.get_default_model_instance(
-                    tenant_id=current_user.current_tenant_id, model_type=ModelType.TEXT_EMBEDDING
-                )
-                dataset.embedding_model = embedding_model.model
-                dataset.embedding_model_provider = embedding_model.provider
+                if knowledge_config.embedding_model and knowledge_config.embedding_model_provider:
+                    dataset_embedding_model = knowledge_config.embedding_model
+                    dataset_embedding_model_provider = knowledge_config.embedding_model_provider
+                else:
+                    embedding_model = model_manager.get_default_model_instance(
+                        tenant_id=current_user.current_tenant_id, model_type=ModelType.TEXT_EMBEDDING
+                    )
+                    dataset_embedding_model = embedding_model.model
+                    dataset_embedding_model_provider = embedding_model.provider
+                dataset.embedding_model = dataset_embedding_model
+                dataset.embedding_model_provider = dataset_embedding_model_provider
                 dataset_collection_binding = DatasetCollectionBindingService.get_dataset_collection_binding(
-                    embedding_model.provider, embedding_model.model
+                    dataset_embedding_model_provider, dataset_embedding_model
                 )
                 dataset.collection_binding_id = dataset_collection_binding.id
                 if not dataset.retrieval_model:
@@ -793,7 +816,11 @@ class DocumentService:
                         "score_threshold_enabled": False,
                     }
 
-                    dataset.retrieval_model = knowledge_config.retrieval_model.model_dump() or default_retrieval_model  # type: ignore
+                    dataset.retrieval_model = (
+                        knowledge_config.retrieval_model.model_dump()
+                        if knowledge_config.retrieval_model
+                        else default_retrieval_model
+                    )  # type: ignore
 
         documents = []
         if knowledge_config.original_document_id:
